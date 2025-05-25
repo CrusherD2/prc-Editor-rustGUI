@@ -45,10 +45,11 @@ jobs:
 
     - name: Build
       run: cargo build --release --target ${{ matrix.target }}
+      working-directory: prc-editor-rust
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
         name: prc-editor-${{ matrix.target }}
-        path: target/${{ matrix.target }}/release/prc-editor-rust${{ matrix.binary-suffix }}
+        path: prc-editor-rust/target/${{ matrix.target }}/release/prc-editor-rust${{ matrix.binary-suffix }}
         if-no-files-found: error 

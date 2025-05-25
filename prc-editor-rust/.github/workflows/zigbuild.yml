@@ -33,36 +33,40 @@ jobs:
 
     - name: Build Windows
       run: cargo zigbuild --release --target x86_64-pc-windows-gnu
+      working-directory: prc-editor-rust
 
     - name: Build macOS Intel
       run: cargo zigbuild --release --target x86_64-apple-darwin
+      working-directory: prc-editor-rust
 
     - name: Build macOS Apple Silicon
       run: cargo zigbuild --release --target aarch64-apple-darwin
+      working-directory: prc-editor-rust
 
     - name: Build Linux
       run: cargo zigbuild --release --target x86_64-unknown-linux-gnu
+      working-directory: prc-editor-rust
 
     - name: Upload Windows artifact
       uses: actions/upload-artifact@v4
       with:
         name: prc-editor-windows
-        path: target/x86_64-pc-windows-gnu/release/prc-editor-rust.exe
+        path: prc-editor-rust/target/x86_64-pc-windows-gnu/release/prc-editor-rust.exe
 
     - name: Upload macOS Intel artifact
       uses: actions/upload-artifact@v4
       with:
         name: prc-editor-macos-intel
-        path: target/x86_64-apple-darwin/release/prc-editor-rust
+        path: prc-editor-rust/target/x86_64-apple-darwin/release/prc-editor-rust
 
     - name: Upload macOS Apple Silicon artifact
       uses: actions/upload-artifact@v4
       with:
         name: prc-editor-macos-arm64
-        path: target/aarch64-apple-darwin/release/prc-editor-rust
+        path: prc-editor-rust/target/aarch64-apple-darwin/release/prc-editor-rust
 
     - name: Upload Linux artifact
       uses: actions/upload-artifact@v4
       with:
         name: prc-editor-linux
-        path: target/x86_64-unknown-linux-gnu/release/prc-editor-rust 
+        path: prc-editor-rust/target/x86_64-unknown-linux-gnu/release/prc-editor-rust 
