@@ -43,11 +43,39 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y libgtk-3-dev libxdo-dev
 
-    - name: Build
+    - name: Remove any cargo config that might interfere
+      run: |
+        rm -f .cargo/config.toml
+        rm -f .cargo/config
+      working-directory: prc-editor-rust
+      continue-on-error: true
+
+    - name: Build (native target)
+      if: |
+        (matrix.os == 'windows-latest' && matrix.target == 'x86_64-pc-windows-msvc') ||
+        (matrix.os == 'ubuntu-latest' && matrix.target == 'x86_64-unknown-linux-gnu') ||
+        (matrix.os == 'macos-latest' && matrix.target == 'x86_64-apple-darwin')
+      run: cargo build --release
+      working-directory: prc-editor-rust
+
+    - name: Build (cross-compile for Apple Silicon)
+      if: matrix.os == 'macos-latest' && matrix.target == 'aarch64-apple-darwin'
       run: cargo build --release --target ${{ matrix.target }}
       working-directory: prc-editor-rust
 
-    - name: Upload artifacts
+    - name: Upload artifacts (native builds)
+      if: |
+        (matrix.os == 'windows-latest' && matrix.target == 'x86_64-pc-windows-msvc') ||
+        (matrix.os == 'ubuntu-latest' && matrix.target == 'x86_64-unknown-linux-gnu') ||
+        (matrix.os == 'macos-latest' && matrix.target == 'x86_64-apple-darwin')
+      uses: actions/upload-artifact@v4
+      with:
+        name: prc-editor-${{ matrix.target }}
+        path: prc-editor-rust/target/release/prc-editor-rust${{ matrix.binary-suffix }}
+        if-no-files-found: error
+
+    - name: Upload artifacts (cross-compiled)
+      if: matrix.os == 'macos-latest' && matrix.target == 'aarch64-apple-darwin'
       uses: actions/upload-artifact@v4
       with:
         name: prc-editor-${{ matrix.target }}
