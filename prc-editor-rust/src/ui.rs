@@ -1200,25 +1200,17 @@ impl PrcEditorApp {
     fn paste_node_into(&mut self, target_path: &str, node_to_paste: ParamNode) -> bool {
         // Get the target node to determine how to paste
         if let Some(target_node) = self.find_node_by_path(target_path) {
-            match (&target_node.value, &node_to_paste.value) {
-                // If both are structs, paste the fields from source into target
-                (ParamValue::Struct(_), ParamValue::Struct(_)) => {
-                    return self.paste_struct_fields(target_path, &node_to_paste);
-                }
-                // If both are lists, paste the items from source into target
-                (ParamValue::List(_), ParamValue::List(_)) => {
-                    return self.paste_list_items(target_path, &node_to_paste);
-                }
-                // If target is a struct and source is not, add source as a new field
-                (ParamValue::Struct(_), _) => {
+            match &target_node.value {
+                // If target is a struct, add source as a new field (regardless of source type)
+                ParamValue::Struct(_) => {
                     return self.add_node_with_undo(target_path, node_to_paste);
                 }
-                // If target is a list and source is not, add source as a new item
-                (ParamValue::List(_), _) => {
+                // If target is a list, add source as a new item (regardless of source type)
+                ParamValue::List(_) => {
                     return self.add_node_with_undo(target_path, node_to_paste);
                 }
                 _ => {
-                    // For other cases, just replace the value using undo tracking
+                    // For other cases (primitive values), replace the value using undo tracking
                     return self.update_node_value_with_undo(target_path, node_to_paste.value);
                 }
             }
@@ -1227,31 +1219,7 @@ impl PrcEditorApp {
         false
     }
     
-    /// Paste struct fields from source into target struct (replaces existing fields)
-    fn paste_struct_fields(&mut self, target_path: &str, source_node: &ParamNode) -> bool {
-        if let ParamValue::Struct(_source_struct) = &source_node.value {
-            // Simply replace the entire target struct with the source struct using undo tracking
-            if self.update_node_value_with_undo(target_path, source_node.value.clone()) {
-                // Rebuild the display tree to show the replaced fields
-                self.param_file.rebuild_tree_with_labels();
-                return true;
-            }
-        }
-        false
-    }
-    
-    /// Paste list items from source into target list (replaces existing items)
-    fn paste_list_items(&mut self, target_path: &str, source_node: &ParamNode) -> bool {
-        if let ParamValue::List(_source_list) = &source_node.value {
-            // Simply replace the entire target list with the source list using undo tracking
-            if self.update_node_value_with_undo(target_path, source_node.value.clone()) {
-                // Rebuild the display tree to show the replaced items
-                self.param_file.rebuild_tree_with_labels();
-                return true;
-            }
-        }
-        false
-    }
+
     
     /// Add a node to the underlying ParamValue structure
     fn add_to_param_value(
@@ -2480,12 +2448,12 @@ impl PrcEditorApp {
                     if let (Some(clipboard_data), Some(selected_path)) = (self.clipboard_data.clone(), self.selected_node.clone()) {
                         if self.paste_node_into(&selected_path, clipboard_data.clone()) {
                             let action = if self.cut_mode { "Moved" } else { "Pasted" };
-                            let paste_type = match (&clipboard_data.value, self.find_node_by_path(&selected_path).map(|n| &n.value)) {
-                                (ParamValue::Struct(_), Some(ParamValue::Struct(_))) => "fields",
-                                (ParamValue::List(_), Some(ParamValue::List(_))) => "items",
+                            let paste_type = match self.find_node_by_path(&selected_path).map(|n| &n.value) {
+                                Some(ParamValue::Struct(_)) => "node into struct",
+                                Some(ParamValue::List(_)) => "node into list",
                                 _ => "node"
                             };
-                            self.status_message = format!("{} {} into {} with {}", action, paste_type, selected_path, shortcut);
+                            self.status_message = format!("{} {} {} with {}", action, paste_type, selected_path, shortcut);
                             
                             // For cut operations, clear the clipboard since it's now moved
                             if self.cut_mode {
@@ -2641,12 +2609,12 @@ impl eframe::App for PrcEditorApp {
                                     if let Some(clipboard_data) = self.clipboard_data.clone() {
                                         if self.paste_node_into(&selected_path, clipboard_data.clone()) {
                                             let action = if self.cut_mode { "Moved" } else { "Pasted" };
-                                            let paste_type = match (&clipboard_data.value, self.find_node_by_path(&selected_path).map(|n| &n.value)) {
-                                                (ParamValue::Struct(_), Some(ParamValue::Struct(_))) => "fields",
-                                                (ParamValue::List(_), Some(ParamValue::List(_))) => "items",
+                                            let paste_type = match self.find_node_by_path(&selected_path).map(|n| &n.value) {
+                                                Some(ParamValue::Struct(_)) => "node into struct",
+                                                Some(ParamValue::List(_)) => "node into list",
                                                 _ => "node"
                                             };
-                                            self.status_message = format!("{} {} into {} via button", action, paste_type, selected_path);
+                                            self.status_message = format!("{} {} {} via button", action, paste_type, selected_path);
                                             
                                             if self.cut_mode {
                                                 self.clipboard = None;
