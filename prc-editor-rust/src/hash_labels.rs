@@ -65,7 +65,6 @@ impl HashLabels {
             .from_reader(csv_content.as_bytes());
 
         let mut count = 0;
-        let mut parse_errors = 0;
         
         for result in reader.records() {
             let record = result?;
@@ -90,14 +89,11 @@ impl HashLabels {
                         self.labels.insert(hash, label.to_string());
                         self.reverse_labels.insert(label.to_string(), hash);
                         count += 1;
-                    } else {
-                        parse_errors += 1;
                     }
+                    // Silently skip invalid hash formats
                 }
-            } else {
-                // Skip malformed records
-                parse_errors += 1;
             }
+            // Silently skip malformed records
         }
         
         Ok(count)
@@ -107,6 +103,7 @@ impl HashLabels {
         self.labels.get(&hash)
     }
 
+    #[allow(dead_code)]
     pub fn get_hash(&self, label: &str) -> Option<u64> {
         self.reverse_labels.get(label).copied()
     }
@@ -147,6 +144,7 @@ impl HashLabels {
         self.labels.is_empty()
     }
 
+    #[allow(dead_code)]
     pub fn get_all_labels(&self) -> &HashMap<u64, String> {
         &self.labels
     }
@@ -205,15 +203,14 @@ impl HashLabels {
         let hash = self.add_label(label);
         
         if let Some(path) = csv_path {
-            if let Err(e) = self.save_to_csv(path) {
-                eprintln!("Warning: Failed to save labels to {}: {}", path, e);
-            }
+            let _ = self.save_to_csv(path);
         }
         
         hash
     }
 
     /// Try to parse a string as either a hex hash or a label name
+    #[allow(dead_code)]
     pub fn parse_hash_or_label(&self, input: &str) -> Result<u64, String> {
         // Try to parse as hex first
         if input.starts_with("0x") {

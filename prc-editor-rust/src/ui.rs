@@ -19,10 +19,39 @@ pub struct PrcEditorApp {
     label_page: usize, // Current page in label editor
     labels_per_page: usize, // Number of labels per page
     clipboard: Option<String>, // Copied node path
+    clipboard_data: Option<ParamNode>, // Actual copied node data
+    cut_mode: bool, // Whether the clipboard operation was cut (vs copy)
     show_shortcuts_help: bool, // Show shortcuts help dialog
     param_labels_path: Option<String>, // Path to the ParamLabels.csv file
     tree_items: Vec<String>, // Flattened list of visible tree items for navigation
     selected_index: Option<usize>, // Index in tree_items for keyboard navigation
+    undo_stack: Vec<UndoAction>, // Stack of undo actions
+    redo_stack: Vec<UndoAction>, // Stack of redo actions
+}
+
+#[derive(Clone)]
+enum UndoAction {
+    DeleteNode {
+        path: String,
+        node: ParamNode,
+        parent_path: String,
+        index: usize,
+    },
+    AddNode {
+        path: String,
+    },
+    UpdateValue {
+        path: String,
+        old_value: ParamValue,
+        new_value: ParamValue,
+    },
+    UpdateKey {
+        path: String,
+        old_name: String,
+        old_hash: u64,
+        new_name: String,
+        new_hash: u64,
+    },
 }
 
 impl PrcEditorApp {
@@ -41,10 +70,14 @@ impl PrcEditorApp {
             label_page: 1,
             labels_per_page: 10,
             clipboard: None,
+            clipboard_data: None,
+            cut_mode: false,
             show_shortcuts_help: false,
             param_labels_path: None,
             tree_items: Vec::new(),
             selected_index: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         };
         
         // Try to load ParamLabels.csv at startup
@@ -374,7 +407,7 @@ impl PrcEditorApp {
                 };
                 
                 // Simplified display for leaf nodes - just name and type
-                let value_display = if matches!(node.value, ParamValue::Hash(_)) {
+                let _value_display = if matches!(node.value, ParamValue::Hash(_)) {
                     node.get_value_string_with_labels(&self.param_file.hash_labels)
                 } else {
                     node.get_value_string()
@@ -520,8 +553,8 @@ impl PrcEditorApp {
                                 // Generate hash for new key name
                                 let new_hash = self.param_file.hash_labels.add_label_and_save(&edit_key, self.param_labels_path.as_deref());
                                 
-                                // Actually update the node using the new method
-                                if self.param_file.update_node_key(&child_path, edit_key.clone(), new_hash) {
+                                // Actually update the node using the new method with undo tracking
+                                if self.update_node_key_with_undo(&child_path, edit_key.clone(), new_hash) {
                                     let path_display = self.param_labels_path.as_deref().unwrap_or("ParamLabels.csv");
                                     new_status_message = Some(format!("Key renamed to '{}' (hash: 0x{:X}) and saved to {}", edit_key, new_hash, path_display));
                                     // Refresh tree to show updated keys
@@ -585,8 +618,8 @@ impl PrcEditorApp {
                                 if matches!(child.value, ParamValue::Hash(_)) && !edit_value.starts_with("0x") {
                                     let hash = self.param_file.hash_labels.add_label_and_save(&edit_value, self.param_labels_path.as_deref());
                                     
-                                    // Actually update the hash value using the new method
-                                    if self.param_file.update_node_value(&child_path, ParamValue::Hash(hash)) {
+                                    // Actually update the hash value using the new method with undo tracking
+                                    if self.update_node_value_with_undo(&child_path, ParamValue::Hash(hash)) {
                                         let path_display = self.param_labels_path.as_deref().unwrap_or("ParamLabels.csv");
                                         new_status_message = Some(format!("Hash40 value set to '{}' (0x{:X}) and saved to {}", edit_value, hash, path_display));
                                         // Refresh tree to show updated values
@@ -653,7 +686,7 @@ impl PrcEditorApp {
                                     };
                                     
                                     if let Some(new_value) = updated_value {
-                                        if self.param_file.update_node_value(&child_path, new_value.clone()) {
+                                        if self.update_node_value_with_undo(&child_path, new_value.clone()) {
                                             new_status_message = Some(format!("Value updated to: {}", edit_value));
                                             // Refresh tree to show updated values
                                             // self.refresh_tree();
@@ -905,6 +938,274 @@ impl PrcEditorApp {
         }
     }
     
+    /// Delete a node at the given path
+    fn delete_node(&mut self, path: &str) -> bool {
+        // Cannot delete root
+        if path == "root" {
+            return false;
+        }
+        
+        let indices = match self.param_file.parse_node_path(path) {
+            Some(indices) => indices,
+            None => return false,
+        };
+        
+        if indices.is_empty() {
+            return false; // Cannot delete root
+        }
+        
+        // Get the node to delete for undo purposes
+        let node_to_delete = match self.find_node_by_path(path) {
+            Some(node) => node.clone(),
+            None => return false,
+        };
+        
+        // Get parent path and index to delete
+        let parent_indices = &indices[..indices.len() - 1];
+        let delete_index = indices[indices.len() - 1];
+        let parent_path = if parent_indices.is_empty() {
+            "root".to_string()
+        } else {
+            format!("root{}", parent_indices.iter().map(|i| format!("[{}]", i)).collect::<String>())
+        };
+        
+        // Delete from the underlying data structure
+        if let Some(root) = &mut self.param_file.root {
+            if Self::delete_from_param_value(&mut root.value, parent_indices, delete_index, 0) {
+                // Record undo action
+                self.push_undo_action(UndoAction::DeleteNode {
+                    path: path.to_string(),
+                    node: node_to_delete,
+                    parent_path,
+                    index: delete_index,
+                });
+                
+                // Also delete from the display tree
+                Self::delete_from_display_tree(&mut self.param_file.root, parent_indices, delete_index, 0);
+                return true;
+            }
+        }
+        
+        false
+    }
+    
+    /// Delete from the underlying ParamValue structure
+    fn delete_from_param_value(
+        value: &mut ParamValue,
+        parent_indices: &[usize],
+        delete_index: usize,
+        depth: usize
+    ) -> bool {
+        if depth == parent_indices.len() {
+            // We're at the parent, delete the child
+            match value {
+                ParamValue::Struct(ref mut s) => {
+                    // Find the hash key at the given index
+                    if let Some((hash_to_remove, _)) = s.fields.get_index(delete_index) {
+                        let hash_to_remove = *hash_to_remove;
+                        s.fields.shift_remove(&hash_to_remove);
+                        return true;
+                    }
+                }
+                ParamValue::List(ref mut l) => {
+                    if delete_index < l.values.len() {
+                        l.values.remove(delete_index);
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+            return false;
+        }
+        
+        // Continue recursing
+        let current_index = parent_indices[depth];
+        match value {
+            ParamValue::Struct(ref mut s) => {
+                if let Some((_, field_value)) = s.fields.get_index_mut(current_index) {
+                    return Self::delete_from_param_value(field_value, parent_indices, delete_index, depth + 1);
+                }
+            }
+            ParamValue::List(ref mut l) => {
+                if current_index < l.values.len() {
+                    return Self::delete_from_param_value(&mut l.values[current_index], parent_indices, delete_index, depth + 1);
+                }
+            }
+            _ => {}
+        }
+        
+        false
+    }
+    
+    /// Delete from the display tree
+    fn delete_from_display_tree(
+        node: &mut Option<ParamNode>,
+        parent_indices: &[usize],
+        delete_index: usize,
+        depth: usize
+    ) -> bool {
+        if let Some(current_node) = node {
+            if depth == parent_indices.len() {
+                // We're at the parent, delete the child
+                if delete_index < current_node.children.len() {
+                    current_node.children.remove(delete_index);
+                    return true;
+                }
+                return false;
+            }
+            
+            // Continue recursing
+            let current_index = parent_indices[depth];
+            if current_index < current_node.children.len() {
+                let mut child_option = Some(std::mem::replace(&mut current_node.children[current_index], ParamNode::new("temp".to_string(), 0, ParamValue::Bool(false))));
+                let result = Self::delete_from_display_tree(&mut child_option, parent_indices, delete_index, depth + 1);
+                if let Some(updated_child) = child_option {
+                    current_node.children[current_index] = updated_child;
+                }
+                return result;
+            }
+        }
+        false
+    }
+    
+    /// Paste a node into the target path
+    fn paste_node_into(&mut self, target_path: &str, node_to_paste: ParamNode) -> bool {
+        // Get the target node to determine how to paste
+        if let Some(target_node) = self.find_node_by_path(target_path) {
+            match (&target_node.value, &node_to_paste.value) {
+                // If both are structs, paste the fields from source into target
+                (ParamValue::Struct(_), ParamValue::Struct(_)) => {
+                    return self.paste_struct_fields(target_path, &node_to_paste);
+                }
+                // If both are lists, paste the items from source into target
+                (ParamValue::List(_), ParamValue::List(_)) => {
+                    return self.paste_list_items(target_path, &node_to_paste);
+                }
+                // If target is a struct and source is not, add source as a new field
+                (ParamValue::Struct(_), _) => {
+                    return self.add_node_with_undo(target_path, node_to_paste);
+                }
+                // If target is a list and source is not, add source as a new item
+                (ParamValue::List(_), _) => {
+                    return self.add_node_with_undo(target_path, node_to_paste);
+                }
+                _ => {
+                    // For other cases, just replace the value using undo tracking
+                    return self.update_node_value_with_undo(target_path, node_to_paste.value);
+                }
+            }
+        }
+        
+        false
+    }
+    
+    /// Paste struct fields from source into target struct (replaces existing fields)
+    fn paste_struct_fields(&mut self, target_path: &str, source_node: &ParamNode) -> bool {
+        if let ParamValue::Struct(_source_struct) = &source_node.value {
+            // Simply replace the entire target struct with the source struct using undo tracking
+            if self.update_node_value_with_undo(target_path, source_node.value.clone()) {
+                // Rebuild the display tree to show the replaced fields
+                self.param_file.rebuild_tree_with_labels();
+                return true;
+            }
+        }
+        false
+    }
+    
+    /// Paste list items from source into target list (replaces existing items)
+    fn paste_list_items(&mut self, target_path: &str, source_node: &ParamNode) -> bool {
+        if let ParamValue::List(_source_list) = &source_node.value {
+            // Simply replace the entire target list with the source list using undo tracking
+            if self.update_node_value_with_undo(target_path, source_node.value.clone()) {
+                // Rebuild the display tree to show the replaced items
+                self.param_file.rebuild_tree_with_labels();
+                return true;
+            }
+        }
+        false
+    }
+    
+    /// Add a node to the underlying ParamValue structure
+    fn add_to_param_value(
+        value: &mut ParamValue,
+        indices: &[usize],
+        node_to_add: ParamNode,
+        depth: usize
+    ) -> bool {
+        if depth == indices.len() {
+            // We're at the target, add the node
+            match value {
+                ParamValue::Struct(ref mut s) => {
+                    // For structs, we need to generate a unique hash if there's a collision
+                    let mut hash = node_to_add.hash;
+                    let mut counter = 1;
+                    while s.fields.contains_key(&hash) {
+                        // Generate a new hash by adding a counter
+                        hash = node_to_add.hash.wrapping_add(counter);
+                        counter += 1;
+                        if counter > 1000 {
+                            return false; // Prevent infinite loop
+                        }
+                    }
+                    s.fields.insert(hash, node_to_add.value);
+                    return true;
+                }
+                ParamValue::List(ref mut l) => {
+                    l.values.push(node_to_add.value);
+                    return true;
+                }
+                _ => return false, // Can only add to structs and lists
+            }
+        }
+        
+        // Continue recursing
+        let current_index = indices[depth];
+        match value {
+            ParamValue::Struct(ref mut s) => {
+                if let Some((_, field_value)) = s.fields.get_index_mut(current_index) {
+                    return Self::add_to_param_value(field_value, indices, node_to_add, depth + 1);
+                }
+            }
+            ParamValue::List(ref mut l) => {
+                if current_index < l.values.len() {
+                    return Self::add_to_param_value(&mut l.values[current_index], indices, node_to_add, depth + 1);
+                }
+            }
+            _ => {}
+        }
+        
+        false
+    }
+    
+    /// Add a node to the display tree
+    #[allow(dead_code)]
+    fn add_to_display_tree(
+        node: &mut Option<ParamNode>,
+        indices: &[usize],
+        node_to_add: ParamNode,
+        depth: usize
+    ) -> bool {
+        if let Some(current_node) = node {
+            if depth == indices.len() {
+                // We're at the target, add the node
+                current_node.children.push(node_to_add);
+                return true;
+            }
+            
+            // Continue recursing
+            let current_index = indices[depth];
+            if current_index < current_node.children.len() {
+                let mut child_option = Some(std::mem::replace(&mut current_node.children[current_index], ParamNode::new("temp".to_string(), 0, ParamValue::Bool(false))));
+                let result = Self::add_to_display_tree(&mut child_option, indices, node_to_add, depth + 1);
+                if let Some(updated_child) = child_option {
+                    current_node.children[current_index] = updated_child;
+                }
+                return result;
+            }
+        }
+        false
+    }
+    
     fn find_node_by_path(&self, path: &str) -> Option<&ParamNode> {
         let root = self.param_file.get_root()?;
         
@@ -934,6 +1235,7 @@ impl PrcEditorApp {
 
     /// Refresh the tree display from the underlying data structure
     /// This should be called after making changes to ensure UI consistency
+    #[allow(dead_code)]
     fn refresh_tree(&mut self) {
         if let Some(_) = self.param_file.get_root() {
             // Preserve expanded state and selection
@@ -989,7 +1291,6 @@ impl PrcEditorApp {
                             }
                         }
                         Err(e) => {
-                            eprintln!("Detailed error: {:#?}", e);
                             self.status_message = format!("Error opening file: {}", e);
                             // Clear any partial data
                             self.param_file.root = None;
@@ -1017,7 +1318,6 @@ impl PrcEditorApp {
                     self.status_message = format!("Successfully saved: {}", file_path.display());
                 }
                 Err(e) => {
-                    eprintln!("Save error: {:#?}", e);
                     self.status_message = format!("Error saving file: {}", e);
                 }
             }
@@ -1142,6 +1442,339 @@ impl PrcEditorApp {
         }
     }
     
+    /// Push an action to the undo stack and clear redo stack
+    fn push_undo_action(&mut self, action: UndoAction) {
+        self.undo_stack.push(action);
+        self.redo_stack.clear(); // Clear redo stack when new action is performed
+        
+        // Limit undo stack size to prevent memory issues
+        if self.undo_stack.len() > 100 {
+            self.undo_stack.remove(0);
+        }
+    }
+    
+    /// Perform undo operation
+    fn undo(&mut self) -> bool {
+        if let Some(action) = self.undo_stack.pop() {
+            match action.clone() {
+                UndoAction::DeleteNode { path, node, parent_path, index } => {
+                    // Restore the deleted node
+                    if self.restore_node_at_index(&parent_path, node, index) {
+                        self.redo_stack.push(UndoAction::AddNode { path });
+                        self.status_message = "Undid delete operation".to_string();
+                        self.build_tree_items();
+                        return true;
+                    }
+                }
+                UndoAction::AddNode { path } => {
+                    // Remove the added node
+                    if let Some(node) = self.find_node_by_path(&path).cloned() {
+                        if let Some(parent_path) = self.get_parent_path(&path) {
+                            if let Some(index) = self.get_node_index_in_parent(&path) {
+                                if self.delete_node(&path) {
+                                    self.redo_stack.push(UndoAction::DeleteNode { 
+                                        path: path.clone(), 
+                                        node, 
+                                        parent_path, 
+                                        index 
+                                    });
+                                    self.status_message = "Undid add operation".to_string();
+                                    self.build_tree_items();
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                UndoAction::UpdateValue { path, old_value, new_value } => {
+                    // Restore the old value
+                    if self.param_file.update_node_value(&path, old_value.clone()) {
+                        self.redo_stack.push(UndoAction::UpdateValue { 
+                            path, 
+                            old_value: new_value, 
+                            new_value: old_value 
+                        });
+                        self.status_message = "Undid value change".to_string();
+                        self.param_file.rebuild_tree_with_labels();
+                        return true;
+                    }
+                }
+                UndoAction::UpdateKey { path, old_name, old_hash, new_name, new_hash } => {
+                    // Restore the old key
+                    if self.param_file.update_node_key(&path, old_name.clone(), old_hash) {
+                        self.redo_stack.push(UndoAction::UpdateKey { 
+                            path, 
+                            old_name: new_name, 
+                            old_hash: new_hash, 
+                            new_name: old_name, 
+                            new_hash: old_hash 
+                        });
+                        self.status_message = "Undid key change".to_string();
+                        self.param_file.rebuild_tree_with_labels();
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+    
+    /// Perform redo operation
+    fn redo(&mut self) -> bool {
+        if let Some(action) = self.redo_stack.pop() {
+            match action.clone() {
+                UndoAction::DeleteNode { path, node, parent_path, index } => {
+                    // Re-delete the node
+                    if self.delete_node(&path) {
+                        self.undo_stack.push(UndoAction::DeleteNode { path, node, parent_path, index });
+                        self.status_message = "Redid delete operation".to_string();
+                        self.build_tree_items();
+                        return true;
+                    }
+                }
+                UndoAction::AddNode { path: _ } => {
+                    // This would require re-adding the node, which is complex
+                    // For now, just indicate it's not supported
+                    self.status_message = "Redo add operation not yet supported".to_string();
+                    return false;
+                }
+                UndoAction::UpdateValue { path, old_value, new_value } => {
+                    // Re-apply the new value
+                    if self.param_file.update_node_value(&path, new_value.clone()) {
+                        self.undo_stack.push(UndoAction::UpdateValue { 
+                            path, 
+                            old_value: old_value, 
+                            new_value: new_value 
+                        });
+                        self.status_message = "Redid value change".to_string();
+                        self.param_file.rebuild_tree_with_labels();
+                        return true;
+                    }
+                }
+                UndoAction::UpdateKey { path, old_name, old_hash, new_name, new_hash } => {
+                    // Re-apply the new key
+                    if self.param_file.update_node_key(&path, new_name.clone(), new_hash) {
+                        self.undo_stack.push(UndoAction::UpdateKey { 
+                            path, 
+                            old_name, 
+                            old_hash, 
+                            new_name, 
+                            new_hash 
+                        });
+                        self.status_message = "Redid key change".to_string();
+                        self.param_file.rebuild_tree_with_labels();
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+    
+    /// Get the index of a node within its parent
+    fn get_node_index_in_parent(&self, path: &str) -> Option<usize> {
+        if let Some(parent_path) = self.get_parent_path(path) {
+            if let Some(_parent_node) = self.find_node_by_path(&parent_path) {
+                // Extract the index from the path
+                if let Some(last_bracket) = path.rfind('[') {
+                    if let Some(close_bracket) = path.rfind(']') {
+                        let index_str = &path[last_bracket + 1..close_bracket];
+                        return index_str.parse::<usize>().ok();
+                    }
+                }
+            }
+        }
+        None
+    }
+    
+    /// Restore a node at a specific index in its parent
+    fn restore_node_at_index(&mut self, parent_path: &str, node: ParamNode, index: usize) -> bool {
+        let parent_indices = match self.param_file.parse_node_path(parent_path) {
+            Some(indices) => indices,
+            None => return false,
+        };
+        
+        // Add to the underlying data structure at the specific index
+        if let Some(root) = &mut self.param_file.root {
+            if Self::restore_to_param_value(&mut root.value, &parent_indices, node.clone(), index, 0) {
+                // Rebuild the display tree to show the restored node
+                self.param_file.rebuild_tree_with_labels();
+                return true;
+            }
+        }
+        
+        false
+    }
+    
+    /// Restore a node to the underlying ParamValue structure at a specific index
+    fn restore_to_param_value(
+        value: &mut ParamValue,
+        indices: &[usize],
+        node_to_restore: ParamNode,
+        target_index: usize,
+        depth: usize
+    ) -> bool {
+        if depth == indices.len() {
+            // We're at the target parent, restore the node at the specific index
+            match value {
+                ParamValue::Struct(ref mut s) => {
+                    // For structs, we need to insert at the correct position
+                    // This is complex with IndexMap, so we'll rebuild it
+                    let mut new_fields = indexmap::IndexMap::new();
+                    let mut current_index = 0;
+                    
+                    // Copy existing fields, inserting the restored node at the target index
+                    for (hash, field_value) in s.fields.iter() {
+                        if current_index == target_index {
+                            new_fields.insert(node_to_restore.hash, node_to_restore.value.clone());
+                            current_index += 1;
+                        }
+                        new_fields.insert(*hash, field_value.clone());
+                        current_index += 1;
+                    }
+                    
+                    // If target index is at the end
+                    if target_index >= s.fields.len() {
+                        new_fields.insert(node_to_restore.hash, node_to_restore.value);
+                    }
+                    
+                    s.fields = new_fields;
+                    return true;
+                }
+                ParamValue::List(ref mut l) => {
+                    if target_index <= l.values.len() {
+                        l.values.insert(target_index, node_to_restore.value);
+                        return true;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        
+        // Continue recursing
+        let current_index = indices[depth];
+        match value {
+            ParamValue::Struct(ref mut s) => {
+                if let Some((_, field_value)) = s.fields.get_index_mut(current_index) {
+                    return Self::restore_to_param_value(field_value, indices, node_to_restore, target_index, depth + 1);
+                }
+            }
+            ParamValue::List(ref mut l) => {
+                if current_index < l.values.len() {
+                    return Self::restore_to_param_value(&mut l.values[current_index], indices, node_to_restore, target_index, depth + 1);
+                }
+            }
+            _ => {}
+        }
+        
+        false
+    }
+
+    /// Update a node's value with undo tracking
+    fn update_node_value_with_undo(&mut self, path: &str, new_value: ParamValue) -> bool {
+        // Get the old value for undo
+        if let Some(old_value) = self.param_file.get_node_value(path) {
+            if self.param_file.update_node_value(path, new_value.clone()) {
+                // Record undo action
+                self.push_undo_action(UndoAction::UpdateValue {
+                    path: path.to_string(),
+                    old_value,
+                    new_value,
+                });
+                return true;
+            }
+        }
+        false
+    }
+    
+    /// Update a node's key with undo tracking
+    fn update_node_key_with_undo(&mut self, path: &str, new_name: String, new_hash: u64) -> bool {
+        // Get the old key for undo
+        if let Some(node) = self.find_node_by_path(path) {
+            let old_name = node.name.clone();
+            let old_hash = node.hash;
+            
+            if self.param_file.update_node_key(path, new_name.clone(), new_hash) {
+                // Record undo action
+                self.push_undo_action(UndoAction::UpdateKey {
+                    path: path.to_string(),
+                    old_name,
+                    old_hash,
+                    new_name,
+                    new_hash,
+                });
+                return true;
+            }
+        }
+        false
+    }
+    
+    /// Add a node with undo tracking
+    fn add_node_with_undo(&mut self, target_path: &str, node_to_add: ParamNode) -> bool {
+        let target_indices = match self.param_file.parse_node_path(target_path) {
+            Some(indices) => indices,
+            None => return false,
+        };
+        
+        // Get the current size to calculate the new index
+        let new_index = if let Some(target_node) = self.find_node_by_path(target_path) {
+            match &target_node.value {
+                ParamValue::Struct(s) => s.fields.len(),
+                ParamValue::List(l) => l.values.len(),
+                _ => return false,
+            }
+        } else {
+            return false;
+        };
+        
+        // Add to the underlying data structure
+        if let Some(root) = &mut self.param_file.root {
+            if Self::add_to_param_value(&mut root.value, &target_indices, node_to_add.clone(), 0) {
+                // Calculate the path where the node was added
+                let added_path = format!("{}[{}]", target_path, new_index);
+                
+                // Record undo action
+                self.push_undo_action(UndoAction::AddNode {
+                    path: added_path,
+                });
+                
+                // Rebuild the display tree to show the new node
+                self.param_file.rebuild_tree_with_labels();
+                return true;
+            }
+        }
+        
+        false
+    }
+
+    /// Generate a sequential name for a new node to avoid duplicates
+    fn generate_sequential_name(&self, parent_path: &str, _base_name: &str) -> String {
+        // Get the parent node to check existing children
+        if let Some(parent_node) = self.find_node_by_path(parent_path) {
+            // Find the highest numeric name among all children
+            let mut max_number = 0;
+            
+            for child in &parent_node.children {
+                // Try to parse the child name as a number
+                if let Ok(number) = child.name.parse::<u32>() {
+                    max_number = max_number.max(number);
+                }
+                
+                // Also try to extract numbers from names like "[18]" 
+                let trimmed = child.name.trim_start_matches('[').trim_end_matches(']');
+                if let Ok(number) = trimmed.parse::<u32>() {
+                    max_number = max_number.max(number);
+                }
+            }
+            
+            // Return the next sequential number with brackets
+            format!("[{}]", max_number + 1)
+        } else {
+            // Fallback if we can't find the parent
+            "[1]".to_string()
+        }
+    }
+    
     /// Find the Smash Ultimate Blender plugin directory
     fn find_blender_addon_directory() -> Option<PathBuf> {
         // Get the user's AppData/Roaming directory
@@ -1212,9 +1845,7 @@ impl PrcEditorApp {
     /// Save the ParamLabels.csv path to a config file
     fn save_labels_path(&self, path: &str) {
         let config_path = Self::get_config_path();
-        if let Err(e) = std::fs::write(&config_path, path) {
-            eprintln!("Warning: Could not save config to {}: {}", config_path.display(), e);
-        }
+        let _ = std::fs::write(&config_path, path);
     }
     
     /// Load the saved ParamLabels.csv path from the config file
@@ -1415,7 +2046,113 @@ impl PrcEditorApp {
     }
 
     fn handle_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
-        ctx.input(|i| {
+        // Try to handle clipboard operations using egui's events
+        ctx.input_mut(|i| {
+            // Check for copy/paste events that egui might have processed
+            if !i.events.is_empty() {
+                for event in &i.events {
+                    match event {
+                        egui::Event::Copy => {
+                            if let Some(selected_path) = &self.selected_node {
+                                self.clipboard = Some(selected_path.clone());
+                                self.clipboard_data = self.find_node_by_path(selected_path).cloned();
+                                self.cut_mode = false;
+                                let has_data = self.clipboard_data.is_some();
+                                self.status_message = format!("Copied node via event: {} (data: {})", selected_path, has_data);
+                            } else {
+                                self.status_message = "Copy event: No node selected".to_string();
+                            }
+                            return;
+                        }
+                        egui::Event::Paste(_text) => {
+                            // Handle paste using our internal clipboard
+                            if let (Some(clipboard_data), Some(selected_path)) = (self.clipboard_data.clone(), self.selected_node.clone()) {
+                                if self.paste_node_into(&selected_path, clipboard_data) {
+                                    let action = if self.cut_mode { "Moved" } else { "Pasted" };
+                                    self.status_message = format!("{} node into {} via paste event", action, selected_path);
+                                    
+                                    // For cut operations, clear the clipboard since it's now moved
+                                    if self.cut_mode {
+                                        self.clipboard = None;
+                                        self.clipboard_data = None;
+                                        self.cut_mode = false;
+                                    }
+                                    
+                                    // Rebuild tree items to show changes
+                                    self.build_tree_items();
+                                } else {
+                                    self.status_message = format!("Failed to paste into {} via paste event", selected_path);
+                                }
+                            } else {
+                                self.status_message = "Paste event: Nothing to paste".to_string();
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            
+
+            
+            // Try alternative shortcut detection using egui's shortcut system
+            if !self.editing_value.is_some() && !self.show_label_editor {
+                // Try using egui's shortcut detection
+                if i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::V)) ||
+                   i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::V)) {
+                    // Handle paste logic here
+                    if let (Some(clipboard_data), Some(selected_path)) = (self.clipboard_data.clone(), self.selected_node.clone()) {
+                        if self.paste_node_into(&selected_path, clipboard_data.clone()) {
+                            let action = if self.cut_mode { "Moved" } else { "Pasted" };
+                            let paste_type = match (&clipboard_data.value, self.find_node_by_path(&selected_path).map(|n| &n.value)) {
+                                (ParamValue::Struct(_), Some(ParamValue::Struct(_))) => "fields",
+                                (ParamValue::List(_), Some(ParamValue::List(_))) => "items",
+                                _ => "node"
+                            };
+                            self.status_message = format!("{} {} into {} with Ctrl+V (shortcut)", action, paste_type, selected_path);
+                            
+                            if self.cut_mode {
+                                self.clipboard = None;
+                                self.clipboard_data = None;
+                                self.cut_mode = false;
+                            }
+                            self.build_tree_items();
+                        } else {
+                            self.status_message = format!("Failed to paste into {} with Ctrl+V (shortcut)", selected_path);
+                        }
+                    } else {
+                        self.status_message = "Ctrl+V (shortcut): Nothing to paste".to_string();
+                    }
+                }
+                
+                if i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::Insert)) ||
+                   i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::ALT, egui::Key::Insert)) {
+                    // Handle paste logic here
+                    if let (Some(clipboard_data), Some(selected_path)) = (self.clipboard_data.clone(), self.selected_node.clone()) {
+                        if self.paste_node_into(&selected_path, clipboard_data.clone()) {
+                            let action = if self.cut_mode { "Moved" } else { "Pasted" };
+                            let paste_type = match (&clipboard_data.value, self.find_node_by_path(&selected_path).map(|n| &n.value)) {
+                                (ParamValue::Struct(_), Some(ParamValue::Struct(_))) => "fields",
+                                (ParamValue::List(_), Some(ParamValue::List(_))) => "items",
+                                _ => "node"
+                            };
+                            self.status_message = format!("{} {} into {} with Shift+Insert (shortcut)", action, paste_type, selected_path);
+                            
+                            if self.cut_mode {
+                                self.clipboard = None;
+                                self.clipboard_data = None;
+                                self.cut_mode = false;
+                            }
+                            self.build_tree_items();
+                        } else {
+                            self.status_message = format!("Failed to paste into {} with Shift+Insert (shortcut)", selected_path);
+                        }
+                    } else {
+                        self.status_message = "Shift+Insert (shortcut): Nothing to paste".to_string();
+                    }
+                }
+            }
+            
             // Only handle shortcuts if no text editing is active
             if !self.editing_value.is_some() && !self.show_label_editor {
                 let ctrl = i.modifiers.ctrl;
@@ -1449,40 +2186,133 @@ impl PrcEditorApp {
                 
                 // DEL - Delete the node
                 if i.key_pressed(egui::Key::Delete) {
-                    if let Some(selected_path) = &self.selected_node {
-                        self.status_message = format!("Delete node: {} (not implemented)", selected_path);
+                    if let Some(selected_path) = self.selected_node.clone() {
+                        if self.delete_node(&selected_path) {
+                            self.status_message = format!("Deleted node: {}", selected_path);
+                            // Clear selection since the node no longer exists
+                            self.selected_node = None;
+                            self.selected_index = None;
+                            // Rebuild tree items
+                            self.build_tree_items();
+                        } else {
+                            self.status_message = format!("Failed to delete node: {}", selected_path);
+                        }
                     }
                 }
                 
-                // CTRL + C - Copy the node
-                if ctrl && i.key_pressed(egui::Key::C) {
+                // CTRL + C - Copy the node (try multiple approaches)
+                if (ctrl && i.key_pressed(egui::Key::C)) || 
+                   (ctrl && i.modifiers.shift && i.key_pressed(egui::Key::C)) ||
+                   (ctrl && i.key_pressed(egui::Key::Insert)) {
                     if let Some(selected_path) = &self.selected_node {
                         self.clipboard = Some(selected_path.clone());
-                        self.status_message = format!("Copied node: {}", selected_path);
+                        self.clipboard_data = self.find_node_by_path(selected_path).cloned();
+                        self.cut_mode = false;
+                        let shortcut = if i.key_pressed(egui::Key::Insert) { "Ctrl+Insert" } 
+                                      else if i.modifiers.shift { "Ctrl+Shift+C" } 
+                                      else { "Ctrl+C" };
+                        self.status_message = format!("Copied node with {}: {}", shortcut, selected_path);
+                    } else {
+                        self.status_message = "No node selected to copy".to_string();
                     }
                 }
                 
                 // CTRL + X - Cut the node
                 if ctrl && i.key_pressed(egui::Key::X) {
-                    if let Some(selected_path) = &self.selected_node {
+                    if let Some(selected_path) = self.selected_node.clone() {
+                        // First copy the node data
+                        if let Some(node_data) = self.find_node_by_path(&selected_path).cloned() {
                         self.clipboard = Some(selected_path.clone());
-                        self.status_message = format!("Cut node: {} (not implemented)", selected_path);
+                            self.clipboard_data = Some(node_data);
+                            self.cut_mode = true;
+                            
+                            // Then delete the node from its current location
+                            if self.delete_node(&selected_path) {
+                                self.status_message = format!("Cut node: {}", selected_path);
+                                // Clear selection since the node no longer exists
+                                self.selected_node = None;
+                                self.selected_index = None;
+                                // Rebuild tree items
+                                self.build_tree_items();
+                            } else {
+                                self.status_message = format!("Failed to cut node: {}", selected_path);
+                                // Clear clipboard if cut failed
+                                self.clipboard = None;
+                                self.clipboard_data = None;
+                                self.cut_mode = false;
+                            }
+                        } else {
+                            self.status_message = format!("Could not find node to cut: {}", selected_path);
+                        }
                     }
                 }
                 
-                // CTRL + V - Paste the copied node into the node
-                if ctrl && i.key_pressed(egui::Key::V) {
-                    if let (Some(clipboard_path), Some(selected_path)) = (&self.clipboard, &self.selected_node) {
-                        self.status_message = format!("Paste {} into {} (not implemented)", clipboard_path, selected_path);
+                // Note: Ctrl+V paste is handled by the egui shortcut system above
+                // Only handle the alternative paste shortcuts here that egui might not catch
+                if (i.modifiers.shift && i.key_pressed(egui::Key::V) && !ctrl) ||  // Shift+V (when Ctrl+V is detected as Shift+V)
+                   (i.modifiers.alt && i.key_pressed(egui::Key::Insert)) {  // Alt+Insert (when Shift+Insert is detected as Alt+Insert)
+                    let shortcut = if i.modifiers.alt && i.key_pressed(egui::Key::Insert) { "Shift+Insert (detected as Alt+Insert)" }
+                                  else { "Ctrl+V (detected as Shift+V)" };
+                    
+                    if let (Some(clipboard_data), Some(selected_path)) = (self.clipboard_data.clone(), self.selected_node.clone()) {
+                        if self.paste_node_into(&selected_path, clipboard_data.clone()) {
+                            let action = if self.cut_mode { "Moved" } else { "Pasted" };
+                            let paste_type = match (&clipboard_data.value, self.find_node_by_path(&selected_path).map(|n| &n.value)) {
+                                (ParamValue::Struct(_), Some(ParamValue::Struct(_))) => "fields",
+                                (ParamValue::List(_), Some(ParamValue::List(_))) => "items",
+                                _ => "node"
+                            };
+                            self.status_message = format!("{} {} into {} with {}", action, paste_type, selected_path, shortcut);
+                            
+                            // For cut operations, clear the clipboard since it's now moved
+                            if self.cut_mode {
+                                self.clipboard = None;
+                                self.clipboard_data = None;
+                                self.cut_mode = false;
+                            }
+                            
+                            // Rebuild tree items to show changes
+                            self.build_tree_items();
+                        } else {
+                            self.status_message = format!("Failed to paste into {} with {}", selected_path, shortcut);
+                        }
                     } else {
-                        self.status_message = "Nothing to paste".to_string();
+                        let has_clipboard = self.clipboard.is_some();
+                        let has_data = self.clipboard_data.is_some();
+                        let has_selection = self.selected_node.is_some();
+                        self.status_message = format!("{}: Nothing to paste (clipboard: {}, data: {}, selection: {})", 
+                            shortcut, has_clipboard, has_data, has_selection);
                     }
                 }
                 
                 // CTRL + P - Paste the copied node into the parent
                 if ctrl && i.key_pressed(egui::Key::P) {
-                    if let (Some(clipboard_path), Some(selected_path)) = (&self.clipboard, &self.selected_node) {
-                        self.status_message = format!("Paste {} into parent of {} (not implemented)", clipboard_path, selected_path);
+                    if let (Some(clipboard_data), Some(selected_path)) = (self.clipboard_data.clone(), self.selected_node.clone()) {
+                        if let Some(parent_path) = self.get_parent_path(&selected_path) {
+                            // Generate a new name for the pasted node to avoid duplicates
+                            let mut new_clipboard_data = clipboard_data.clone();
+                            new_clipboard_data.name = self.generate_sequential_name(&parent_path, &clipboard_data.name);
+                            new_clipboard_data.hash = self.param_file.hash_labels.add_label_and_save(&new_clipboard_data.name, self.param_labels_path.as_deref());
+                            
+                            if self.paste_node_into(&parent_path, new_clipboard_data) {
+                                let action = if self.cut_mode { "Moved" } else { "Pasted" };
+                                self.status_message = format!("{} node into parent of {}", action, selected_path);
+                                
+                                // For cut operations, clear the clipboard since it's now moved
+                                if self.cut_mode {
+                                    self.clipboard = None;
+                                    self.clipboard_data = None;
+                                    self.cut_mode = false;
+                                }
+                                
+                                // Rebuild tree items to show changes
+                                self.build_tree_items();
+                            } else {
+                                self.status_message = format!("Failed to paste into parent of {}", selected_path);
+                            }
+                        } else {
+                            self.status_message = "Root node has no parent".to_string();
+                        }
                     } else {
                         self.status_message = "Nothing to paste into parent".to_string();
                     }
@@ -1490,8 +2320,27 @@ impl PrcEditorApp {
                 
                 // CTRL + D - Duplicate param on the same level
                 if ctrl && i.key_pressed(egui::Key::D) {
-                    if let Some(selected_path) = &self.selected_node {
-                        self.status_message = format!("Duplicate node: {} (not implemented)", selected_path);
+                    if let Some(selected_path) = self.selected_node.clone() {
+                        if let Some(node_to_duplicate) = self.find_node_by_path(&selected_path).cloned() {
+                            if let Some(parent_path) = self.get_parent_path(&selected_path) {
+                                // Generate a new name for the duplicated node
+                                let mut new_node = node_to_duplicate.clone();
+                                new_node.name = self.generate_sequential_name(&parent_path, &node_to_duplicate.name);
+                                new_node.hash = self.param_file.hash_labels.add_label_and_save(&new_node.name, self.param_labels_path.as_deref());
+                                
+                                if self.paste_node_into(&parent_path, new_node) {
+                                    self.status_message = format!("Duplicated node: {}", selected_path);
+                                    // Rebuild tree items to show changes
+                                    self.build_tree_items();
+                                } else {
+                                    self.status_message = format!("Failed to duplicate node: {}", selected_path);
+                                }
+                            } else {
+                                self.status_message = "Cannot duplicate root node".to_string();
+                            }
+                        } else {
+                            self.status_message = format!("Could not find node to duplicate: {}", selected_path);
+                        }
                     }
                 }
                 
@@ -1501,6 +2350,24 @@ impl PrcEditorApp {
                         self.save_file_dialog();
                     } else {
                         self.status_message = "No file to save".to_string();
+                    }
+                }
+                
+                // CTRL + Z - Undo
+                if ctrl && i.key_pressed(egui::Key::Z) {
+                    if self.undo() {
+                        // Undo was successful, status message is set by undo()
+                    } else {
+                        self.status_message = "Nothing to undo".to_string();
+                    }
+                }
+                
+                // CTRL + Y - Redo
+                if ctrl && i.key_pressed(egui::Key::Y) {
+                    if self.redo() {
+                        // Redo was successful, status message is set by redo()
+                    } else {
+                        self.status_message = "Nothing to redo".to_string();
                     }
                 }
                 
@@ -1551,7 +2418,7 @@ impl PrcEditorApp {
                         ui.label("Delete the node");
                         ui.end_row();
                         
-                        ui.monospace("CTRL + C");
+                        ui.monospace("CTRL + C / CTRL + Insert");
                         ui.label("Copy the node");
                         ui.end_row();
                         
@@ -1559,7 +2426,7 @@ impl PrcEditorApp {
                         ui.label("Cut the node");
                         ui.end_row();
                         
-                        ui.monospace("CTRL + V");
+                        ui.monospace("SHIFT + Insert");
                         ui.label("Paste the copied node into the node");
                         ui.end_row();
                         
@@ -1573,6 +2440,14 @@ impl PrcEditorApp {
                         
                         ui.monospace("CTRL + S");
                         ui.label("Save the file");
+                        ui.end_row();
+                        
+                        ui.monospace("CTRL + Z");
+                        ui.label("Undo last action");
+                        ui.end_row();
+                        
+                        ui.monospace("CTRL + Y");
+                        ui.label("Redo last undone action");
                         ui.end_row();
                         
                         ui.monospace("F1");
@@ -1619,11 +2494,51 @@ impl eframe::App for PrcEditorApp {
                     ui.label("Status:");
                     ui.label(&self.status_message);
                     
-                    // Show shortcuts button
+                    // Show shortcuts button and paste buttons for testing
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Shortcuts").clicked() {
                             self.show_shortcuts_help = true;
                         }
+                        
+                        // Add paste button for testing
+                        if let Some(_) = &self.clipboard_data {
+                            if ui.button("Paste").clicked() {
+                                if let Some(selected_path) = self.selected_node.clone() {
+                                    if let Some(clipboard_data) = self.clipboard_data.clone() {
+                                        if self.paste_node_into(&selected_path, clipboard_data.clone()) {
+                                            let action = if self.cut_mode { "Moved" } else { "Pasted" };
+                                            let paste_type = match (&clipboard_data.value, self.find_node_by_path(&selected_path).map(|n| &n.value)) {
+                                                (ParamValue::Struct(_), Some(ParamValue::Struct(_))) => "fields",
+                                                (ParamValue::List(_), Some(ParamValue::List(_))) => "items",
+                                                _ => "node"
+                                            };
+                                            self.status_message = format!("{} {} into {} via button", action, paste_type, selected_path);
+                                            
+                                            if self.cut_mode {
+                                                self.clipboard = None;
+                                                self.clipboard_data = None;
+                                                self.cut_mode = false;
+                                            }
+                                            self.build_tree_items();
+                                        } else {
+                                            self.status_message = format!("Failed to paste into {} via button", selected_path);
+                                        }
+                                    }
+                                } else {
+                                    self.status_message = "No node selected for paste".to_string();
+                                }
+                            }
+                        }
+                        
+                        // Show clipboard status
+                        if let Some(clipboard_path) = &self.clipboard {
+                            let mode = if self.cut_mode { "Cut" } else { "Copy" };
+                            let has_data = self.clipboard_data.is_some();
+                            ui.label(&format!("Clipboard: {} {} (data: {})", mode, clipboard_path, has_data));
+                        }
+                        
+                        // Show undo/redo stack info
+                        ui.label(&format!("Undo: {} | Redo: {}", self.undo_stack.len(), self.redo_stack.len()));
                         
                         // Show labels count and file path
                         if let Some(path) = &self.param_labels_path {

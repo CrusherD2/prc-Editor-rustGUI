@@ -31,8 +31,7 @@ fn main() -> Result<(), eframe::Error> {
 
 #[cfg(target_os = "horizon")]
 fn main() {
-    println!("PRC Editor for Nintendo Switch");
-    println!("This would be a console-based or hook-based version");
+
     // TODO: Implement Switch-specific functionality
     // Could be a console interface or hooks into the game's parameter system
 } 

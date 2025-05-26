@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hasher};
+
 use indexmap::IndexMap;
 
 // Helper enum for reference entries (mimicking paracobNET's mixed list)
@@ -47,19 +47,10 @@ impl ParamFile {
         let hash_table_size = cursor.read_i32::<LittleEndian>()?;
         let ref_table_size = cursor.read_i32::<LittleEndian>()?;
 
-        println!("File: {}", filename);
-        println!("Magic: {}", magic_str);
-        println!("Hash table size: {} bytes", hash_table_size);
-        println!("Ref table size: {} bytes", ref_table_size);
-
         // Calculate offsets
         let hash_start = 0x10;
         let ref_start = 0x10 + hash_table_size;
         let param_start = 0x10 + hash_table_size + ref_table_size;
-
-        println!("Hash start: 0x{:X}", hash_start);
-        println!("Ref start: 0x{:X}", ref_start);
-        println!("Param start: 0x{:X}", param_start);
 
         // Read hash table
         cursor.seek(SeekFrom::Start(hash_start as u64))?;
@@ -69,8 +60,7 @@ impl ParamFile {
         for _ in 0..hash_count {
             hash_table.push(cursor.read_u64::<LittleEndian>()?);
         }
-        
-        println!("Loaded {} hash table entries", hash_table.len());
+
 
         // Start reading from param section
         cursor.seek(SeekFrom::Start(param_start as u64))?;
@@ -95,11 +85,6 @@ impl ParamFile {
 
     fn read_param(&mut self, cursor: &mut Cursor<&[u8]>, hash_table: &[u64], hash_start: i32, ref_start: i32) -> Result<ParamValue> {
         let type_byte = cursor.read_u8()?;
-        
-        // Only print debug for unknown types
-        if type_byte > 12 {
-            println!("Reading param at offset 0x{:X}, type: {}", cursor.position() - 1, type_byte);
-        }
         
         match type_byte {
             1 => Ok(ParamValue::Bool(cursor.read_u8()? != 0)),
@@ -191,8 +176,6 @@ impl ParamFile {
             }
             _ => {
                 // Handle unknown types like the JavaScript parser
-                println!("Warning: Unknown parameter type {} at offset 0x{:X}, creating placeholder", type_byte, cursor.position() - 1);
-                
                 // Try to determine a reasonable default value size based on type number
                 let default_size = if type_byte < 50 { 4 } else if type_byte < 100 { 8 } else { 12 };
                 
@@ -213,6 +196,7 @@ impl ParamFile {
         self.root.as_ref()
     }
 
+    #[allow(dead_code)]
     pub fn get_root_mut(&mut self) -> Option<&mut ParamNode> {
         self.root.as_mut()
     }
@@ -239,6 +223,7 @@ impl ParamFile {
     }
     
     /// Get mutable reference to node at path
+    #[allow(dead_code)]
     pub fn get_node_mut(&mut self, path: &str) -> Option<&mut ParamNode> {
         let indices = self.parse_node_path(path)?;
         let root = self.get_root_mut()?;
@@ -315,6 +300,60 @@ impl ParamFile {
             }
         }
         false
+    }
+
+    /// Get the current value of a node at the given path
+    pub fn get_node_value(&self, path: &str) -> Option<ParamValue> {
+        let indices = match self.parse_node_path(path) {
+            Some(indices) => indices,
+            None => return None,
+        };
+        
+        if indices.is_empty() {
+            // Getting root value
+            return self.root.as_ref().map(|r| r.value.clone());
+        }
+        
+        if let Some(root) = &self.root {
+            Self::get_param_value_at_path(&root.value, &indices, 0)
+        } else {
+            None
+        }
+    }
+    
+    /// Get a ParamValue at a specific path in the data structure
+    fn get_param_value_at_path(value: &ParamValue, indices: &[usize], depth: usize) -> Option<ParamValue> {
+        if depth >= indices.len() {
+            return Some(value.clone());
+        }
+        
+        let current_index = indices[depth];
+        
+        match value {
+            ParamValue::Struct(s) => {
+                if let Some((_, field_value)) = s.fields.iter().nth(current_index) {
+                    if depth == indices.len() - 1 {
+                        Some(field_value.clone())
+                    } else {
+                        Self::get_param_value_at_path(field_value, indices, depth + 1)
+                    }
+                } else {
+                    None
+                }
+            }
+            ParamValue::List(l) => {
+                if current_index < l.values.len() {
+                    if depth == indices.len() - 1 {
+                        Some(l.values[current_index].clone())
+                    } else {
+                        Self::get_param_value_at_path(&l.values[current_index], indices, depth + 1)
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 
     /// Update a node's value and update the underlying data structure
@@ -463,6 +502,7 @@ impl ParamFile {
     
     /// Rebuild the tree from the current root data structure
     /// This ensures the display tree is synchronized with the underlying data
+    #[allow(dead_code)]
     pub fn rebuild_tree(&mut self) {
         if let Some(root_value) = &self.root.as_ref().map(|n| n.value.clone()) {
             self.root = Some(ParamNode::from_value(0x0, root_value.clone(), &self.hash_labels));
@@ -543,11 +583,7 @@ impl ParamFile {
                 if let Some(ref_table_offset) = ref_table_offsets.get(ref_entry_index) {
                     param_cursor.seek(SeekFrom::Start(position as u64))?;
                     param_cursor.write_i32::<LittleEndian>(*ref_table_offset as i32)?;
-                } else {
-                    println!("Warning: Could not find ref table offset for struct ref entry {}", ref_entry_index);
                 }
-            } else {
-                println!("Warning: Could not find ref entry for struct id 0x{:X}", struct_id);
             }
         }
         
@@ -556,8 +592,6 @@ impl ParamFile {
             if let Some(offset) = string_offsets.get(&string) {
                 param_cursor.seek(SeekFrom::Start(position as u64))?;
                 param_cursor.write_i32::<LittleEndian>(*offset as i32)?;
-            } else {
-                println!("Warning: Could not find ref table offset for string '{}'", string);
             }
         }
         
@@ -585,10 +619,7 @@ impl ParamFile {
         output.extend(param_data);
         
         // Write to file
-        let output_len = output.len();
         std::fs::write(output_path, output)?;
-        
-        println!("Saved {} bytes to {}", output_len, output_path);
         Ok(())
     }
     
@@ -756,6 +787,7 @@ impl ParamFile {
     }
     
     /// Calculate a hash for struct based on its field pattern (for deduplication)
+    #[allow(dead_code)]
     fn calculate_struct_hash(&self, s: &ParamStruct) -> u64 {
         let mut sorted_fields: Vec<_> = s.fields.keys().collect();
         sorted_fields.sort();
@@ -769,11 +801,12 @@ impl ParamFile {
     }
     
     /// Merge duplicate struct reference entries like paracobNET's MergeRefTables
+    #[allow(dead_code)]
     fn merge_ref_tables(
         &self, 
         ref_entries: &mut Vec<RefEntry>, 
         struct_ref_entries: &mut HashMap<u64, usize>,
-        unresolved_structs: &mut Vec<(usize, u64)>
+        _unresolved_structs: &mut Vec<(usize, u64)>
     ) {
         let mut i = 0;
         while i < ref_entries.len() {
@@ -791,7 +824,7 @@ impl ParamFile {
                 
                 if let Some(duplicate_index) = found_duplicate {
                     // Update struct_ref_entries to point to the earlier entry
-                    for (struct_hash, ref_entry_index) in struct_ref_entries.iter_mut() {
+                    for (_struct_hash, ref_entry_index) in struct_ref_entries.iter_mut() {
                         if *ref_entry_index == i {
                             *ref_entry_index = duplicate_index;
                         } else if *ref_entry_index > i {

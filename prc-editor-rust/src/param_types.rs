@@ -48,22 +48,24 @@ impl ParamNode {
     }
     
     /// Update the key name and hash of this node
+    #[allow(dead_code)]
     pub fn update_key(&mut self, new_name: String, new_hash: u64) {
         self.name = new_name;
         self.hash = new_hash;
     }
     
     /// Update the value of this node
+    #[allow(dead_code)]
     pub fn update_value(&mut self, new_value: ParamValue) {
         self.value = new_value;
         // Rebuild children if it's a struct or list
         self.children.clear();
         match &self.value {
-            ParamValue::Struct(s) => {
+            ParamValue::Struct(_s) => {
                 // Would need hash_labels reference to rebuild children properly
                 // For now, just clear children - they'll be rebuilt when needed
             }
-            ParamValue::List(l) => {
+            ParamValue::List(_l) => {
                 // Similar issue - would need to rebuild children
             }
             _ => {}
@@ -71,6 +73,7 @@ impl ParamNode {
     }
     
     /// Get mutable reference to child at path
+    #[allow(dead_code)]
     pub fn get_child_mut(&mut self, path: &[usize]) -> Option<&mut ParamNode> {
         if path.is_empty() {
             return Some(self);
