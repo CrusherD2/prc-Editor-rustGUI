@@ -21,7 +21,7 @@ pub struct PrcEditorApp {
     clipboard: Option<String>, // Copied node path
     clipboard_data: Option<ParamNode>, // Actual copied node data
     cut_mode: bool, // Whether the clipboard operation was cut (vs copy)
-    show_shortcuts_help: bool, // Show shortcuts help dialog
+    // show_shortcuts_help removed - shortcuts are now always visible
     param_labels_path: Option<String>, // Path to the ParamLabels.csv file
     tree_items: Vec<String>, // Flattened list of visible tree items for navigation
     selected_index: Option<usize>, // Index in tree_items for keyboard navigation
@@ -61,7 +61,7 @@ impl PrcEditorApp {
             selected_node: None,
             expanded_nodes: HashSet::new(),
             status_message: "Ready".to_string(),
-            tree_width: 300.0,
+            tree_width: 700.0,
             show_label_editor: false,
             label_editor_filter: String::new(),
             editing_value: None,
@@ -72,7 +72,7 @@ impl PrcEditorApp {
             clipboard: None,
             clipboard_data: None,
             cut_mode: false,
-            show_shortcuts_help: false,
+            // show_shortcuts_help removed
             param_labels_path: None,
             tree_items: Vec::new(),
             selected_index: None,
@@ -278,11 +278,11 @@ impl PrcEditorApp {
         });
     }
 
-    fn show_main_content(&mut self, _ctx: &egui::Context, ui: &mut egui::Ui) {
+    fn show_main_content(&mut self, ui: &mut egui::Ui) {
         egui::SidePanel::left("parameter_tree")
             .resizable(true)
             .default_width(self.tree_width)
-            .width_range(200.0..=500.0)
+            .min_width(200.0)
             .show_inside(ui, |ui| {
                 ui.heading("Parameter Tree");
                 ui.separator();
@@ -292,9 +292,9 @@ impl PrcEditorApp {
                     self.build_tree_items();
                 }
                 
-                // Make the scroll area fill all available vertical space
+                // Make the scroll area use all available space
                 egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])  // Don't shrink horizontally or vertically
+                    .auto_shrink([false, false])  // Don't shrink in either direction
                     .show(ui, |ui| {
                     if self.param_labels_path.is_none() {
                         ui.vertical_centered(|ui| {
@@ -330,6 +330,8 @@ impl PrcEditorApp {
             ui.heading("Parameter Details");
             ui.separator();
             
+            // Main content area with shortcuts overlay
+            
             if let Some(selected_path) = self.selected_node.clone() {
                 self.show_parameter_details(ui, &selected_path);
             } else {
@@ -338,6 +340,68 @@ impl PrcEditorApp {
                     ui.label("Select a parameter to view details");
                 });
             }
+            
+            // Add shortcuts box as overlay in absolute bottom-right corner
+            let shortcuts_box_width = 280.0;
+            let shortcuts_box_height = 200.0;
+            
+            // Use the UI's clip rect to get the actual drawable area and move closer to corner
+            let clip_rect = ui.clip_rect();
+            let shortcuts_pos = egui::pos2(
+                clip_rect.max.x - shortcuts_box_width - 5.0, // Move 5 pixels away from right edge (inward)
+                clip_rect.max.y - shortcuts_box_height - 5.0 // Move 5 pixels away from bottom edge (inward)
+            );
+            
+            // Draw the shortcuts box as overlay (non-interactive background element)
+            ui.allocate_ui_at_rect(
+                egui::Rect::from_min_size(shortcuts_pos, egui::vec2(shortcuts_box_width, shortcuts_box_height)),
+                |ui| {
+                    // Background frame
+                    let frame = egui::Frame::default()
+                        .fill(egui::Color32::from_rgba_unmultiplied(40, 40, 40, 200))
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(80, 80, 80, 150)))
+                        .rounding(egui::Rounding::same(8.0))
+                        .inner_margin(egui::Margin::same(12.0));
+                    
+                    frame.show(ui, |ui| {
+                        ui.vertical(|ui| {
+                            ui.colored_label(
+                                egui::Color32::from_rgba_unmultiplied(200, 200, 200, 255),
+                                egui::RichText::new("Keyboard Shortcuts").size(14.0).strong()
+                            );
+                            ui.add_space(8.0);
+                            
+                            let shortcuts = [
+                                ("↑↓←→", "Navigate tree"),
+                                ("Enter", "Expand/collapse"),
+                                ("F2", "Rename node"),
+                                ("Del", "Delete node"),
+                                ("Ctrl+C", "Copy node"),
+                                ("Ctrl+X", "Cut node"),
+                                ("Ctrl+V", "Paste node"),
+                                ("Ctrl+P", "Paste to parent"),
+                                ("Ctrl+D", "Duplicate node"),
+                                ("Ctrl+S", "Save file"),
+                                ("Ctrl+Z", "Undo"),
+                                ("Ctrl+Y", "Redo"),
+                            ];
+                            
+                            for (key, desc) in shortcuts {
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgba_unmultiplied(150, 200, 255, 255),
+                                        egui::RichText::new(key).size(11.0).monospace()
+                                    );
+                                    ui.colored_label(
+                                        egui::Color32::from_rgba_unmultiplied(180, 180, 180, 255),
+                                        egui::RichText::new(desc).size(11.0)
+                                    );
+                                });
+                            }
+                        });
+                    });
+                }
+            );
         });
     }
 
@@ -457,7 +521,71 @@ impl PrcEditorApp {
                     .spacing([20.0, 4.0])
                     .show(ui, |ui| {
                         ui.strong("Name:");
-                        ui.label(&node_clone.name);
+                        
+                        // Make name editable
+                        let name_edit_path = format!("{}_name", selected_path);
+                        let is_editing_name = self.editing_value.as_ref()
+                            .map(|(path, _)| path == &name_edit_path)
+                            .unwrap_or(false);
+                        
+                        if is_editing_name {
+                            let mut edit_name = self.editing_value.as_ref().unwrap().1.clone();
+                            let response = ui.text_edit_singleline(&mut edit_name);
+                            
+                            if response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                // Get the current node name to check if it actually changed
+                                let current_name = if let Some(current_node) = self.find_node_by_path(selected_path) {
+                                    current_node.name.clone()
+                                } else {
+                                    String::new()
+                                };
+                                
+                                // Only proceed if the name actually changed
+                                if edit_name != current_name {
+                                    // Check for duplicate names and add failsafe
+                                    let final_name = self.ensure_unique_name(selected_path, &edit_name);
+                                    
+                                    // Generate hash for new name
+                                    let new_hash = self.param_file.hash_labels.add_label_and_save(&final_name, self.param_labels_path.as_deref());
+                                    
+                                    // Update the node name and hash
+                                    if self.update_node_key_with_undo(selected_path, final_name.clone(), new_hash) {
+                                        let path_display = self.param_labels_path.as_deref().unwrap_or("ParamLabels.csv");
+                                        let message = if final_name != edit_name {
+                                            format!("Node renamed to '{}' (was duplicate, added suffix) (hash: 0x{:X}) and saved to {}", final_name, new_hash, path_display)
+                                        } else {
+                                            format!("Node renamed to '{}' (hash: 0x{:X}) and saved to {}", final_name, new_hash, path_display)
+                                        };
+                                        self.status_message = message;
+                                        // Rebuild tree to show updated name
+                                        self.param_file.rebuild_tree_with_labels();
+                                    } else {
+                                        self.status_message = "Failed to update node name".to_string();
+                                    }
+                                } else {
+                                    // Name didn't change, just show a message
+                                    self.status_message = "Name unchanged".to_string();
+                                }
+                                self.editing_value = None;
+                            } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                self.editing_value = None;
+                            } else {
+                                self.editing_value = Some((name_edit_path.clone(), edit_name));
+                            }
+                        } else {
+                            let response = ui.add(
+                                egui::Label::new(egui::RichText::new(&node_clone.name).strong())
+                                    .sense(egui::Sense::click())
+                            );
+                            
+                            if response.clicked() {
+                                self.editing_value = Some((name_edit_path, node_clone.name.clone()));
+                            }
+                            
+                            if response.hovered() {
+                                response.on_hover_text("Click to rename");
+                            }
+                        }
                         ui.end_row();
                         
                         ui.strong("Hash:");
@@ -1775,6 +1903,97 @@ impl PrcEditorApp {
         }
     }
     
+    /// Ensure a name is unique by adding _copy suffix if needed
+    fn ensure_unique_name(&self, node_path: &str, desired_name: &str) -> String {
+        // Get the parent path to check for siblings
+        if let Some(parent_path) = self.get_parent_path(node_path) {
+            if let Some(parent_node) = self.find_node_by_path(&parent_path) {
+                // Check if the desired name conflicts with any sibling (excluding self)
+                let current_node_index = self.get_node_index_in_parent(node_path);
+                
+                let name_conflicts = parent_node.children.iter().enumerate().any(|(i, child)| {
+                    // Don't compare with self
+                    if let Some(current_index) = current_node_index {
+                        if i == current_index {
+                            return false;
+                        }
+                    }
+                    child.name == desired_name
+                });
+                
+                if name_conflicts {
+                    // Add _# suffix starting from _2
+                    let mut copy_counter = 2;
+                    loop {
+                        let copy_name = format!("{}_{}", desired_name, copy_counter);
+                        
+                        let copy_exists = parent_node.children.iter().enumerate().any(|(i, child)| {
+                            // Don't compare with self
+                            if let Some(current_index) = current_node_index {
+                                if i == current_index {
+                                    return false;
+                                }
+                            }
+                            child.name == copy_name
+                        });
+                        
+                        if !copy_exists {
+                            return copy_name;
+                        }
+                        
+                        copy_counter += 1;
+                        if copy_counter > 100 {
+                            break; // Prevent infinite loop
+                        }
+                    }
+                }
+            }
+        }
+        
+        // No conflict or couldn't check, return original name
+        desired_name.to_string()
+    }
+    
+    /// Generate a name for pasting, preserving original names when possible
+    fn generate_paste_name(&self, parent_path: &str, original_name: &str) -> String {
+        // If the original name is not a number or bracketed number, try to preserve it
+        let is_numeric = original_name.parse::<u32>().is_ok();
+        let is_bracketed_numeric = {
+            let trimmed = original_name.trim_start_matches('[').trim_end_matches(']');
+            original_name.starts_with('[') && original_name.ends_with(']') && trimmed.parse::<u32>().is_ok()
+        };
+        
+        if !is_numeric && !is_bracketed_numeric {
+            // Check if this name already exists in the parent
+            if let Some(parent_node) = self.find_node_by_path(parent_path) {
+                let name_exists = parent_node.children.iter().any(|child| child.name == original_name);
+                if !name_exists {
+                    // Original name doesn't exist, we can use it as-is
+                    return original_name.to_string();
+                }
+                
+                // If it exists, try adding _# suffix for text names starting from _2
+                let mut copy_counter = 2;
+                loop {
+                    let copy_name = format!("{}_{}", original_name, copy_counter);
+                    
+                    let copy_exists = parent_node.children.iter().any(|child| child.name == copy_name);
+                    if !copy_exists {
+                        return copy_name;
+                    }
+                    
+                    copy_counter += 1;
+                    if copy_counter > 100 {
+                        break; // Prevent infinite loop
+                    }
+                }
+            }
+        }
+        
+        // For numeric names or when name conflicts exist, generate sequential name
+        self.generate_sequential_name(parent_path, original_name)
+    }
+    
     /// Find the Smash Ultimate Blender plugin directory
     fn find_blender_addon_directory() -> Option<PathBuf> {
         // Get the user's AppData/Roaming directory
@@ -2096,7 +2315,7 @@ impl PrcEditorApp {
 
             
             // Try alternative shortcut detection using egui's shortcut system
-            if !self.editing_value.is_some() && !self.show_label_editor {
+            if !self.editing_value.is_some() {
                 // Try using egui's shortcut detection
                 if i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::V)) ||
                    i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::V)) {
@@ -2154,7 +2373,7 @@ impl PrcEditorApp {
             }
             
             // Only handle shortcuts if no text editing is active
-            if !self.editing_value.is_some() && !self.show_label_editor {
+            if !self.editing_value.is_some() {
                 let ctrl = i.modifiers.ctrl;
                 
                 // Arrow key navigation
@@ -2206,7 +2425,11 @@ impl PrcEditorApp {
                    (ctrl && i.key_pressed(egui::Key::Insert)) {
                     if let Some(selected_path) = &self.selected_node {
                         self.clipboard = Some(selected_path.clone());
-                        self.clipboard_data = self.find_node_by_path(selected_path).cloned();
+                        let node_data = self.find_node_by_path(selected_path).cloned();
+                        
+
+                        
+                        self.clipboard_data = node_data;
                         self.cut_mode = false;
                         let shortcut = if i.key_pressed(egui::Key::Insert) { "Ctrl+Insert" } 
                                       else if i.modifiers.shift { "Ctrl+Shift+C" } 
@@ -2289,10 +2512,14 @@ impl PrcEditorApp {
                 if ctrl && i.key_pressed(egui::Key::P) {
                     if let (Some(clipboard_data), Some(selected_path)) = (self.clipboard_data.clone(), self.selected_node.clone()) {
                         if let Some(parent_path) = self.get_parent_path(&selected_path) {
-                            // Generate a new name for the pasted node to avoid duplicates
+                            // Generate a new name for the pasted node, preserving original names when possible
                             let mut new_clipboard_data = clipboard_data.clone();
-                            new_clipboard_data.name = self.generate_sequential_name(&parent_path, &clipboard_data.name);
+                            let original_name = &clipboard_data.name;
+                            let generated_name = self.generate_paste_name(&parent_path, original_name);
+                            new_clipboard_data.name = generated_name.clone();
                             new_clipboard_data.hash = self.param_file.hash_labels.add_label_and_save(&new_clipboard_data.name, self.param_labels_path.as_deref());
+                            
+
                             
                             if self.paste_node_into(&parent_path, new_clipboard_data) {
                                 let action = if self.cut_mode { "Moved" } else { "Pasted" };
@@ -2371,103 +2598,23 @@ impl PrcEditorApp {
                     }
                 }
                 
-                // F1 or ? - Show shortcuts help
-                if i.key_pressed(egui::Key::F1) {
-                    self.show_shortcuts_help = true;
+                // F2 - Rename selected node
+                if i.key_pressed(egui::Key::F2) {
+                    if let Some(selected_path) = &self.selected_node {
+                        if let Some(node) = self.find_node_by_path(selected_path) {
+                            let name_edit_path = format!("{}_name", selected_path);
+                            self.editing_value = Some((name_edit_path, node.name.clone()));
+                            self.status_message = "Press Enter to confirm rename, Escape to cancel".to_string();
+                        }
+                    }
                 }
+                
+                // F1 key removed - shortcuts are now always visible
             }
         });
     }
 
-    fn show_shortcuts_help_window(&mut self, ctx: &egui::Context) {
-        if !self.show_shortcuts_help {
-            return;
-        }
-        
-        let mut open = true;
-        
-        egui::Window::new("Tree Shortcuts")
-            .default_size([400.0, 300.0])
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.heading("Keyboard Shortcuts");
-                ui.separator();
-                
-                egui::Grid::new("shortcuts_grid")
-                    .num_columns(2)
-                    .striped(true)
-                    .spacing([15.0, 8.0])
-                    .show(ui, |ui| {
-                        ui.strong("Key");
-                        ui.strong("Action");
-                        ui.end_row();
-                        
-                        ui.monospace("↑/↓");
-                        ui.label("Navigate up/down in the tree");
-                        ui.end_row();
-                        
-                        ui.monospace("←/→");
-                        ui.label("Collapse/expand nodes or navigate to parent/child");
-                        ui.end_row();
-                        
-                        ui.monospace("ENTER");
-                        ui.label("Open a data grid for the selected node");
-                        ui.end_row();
-                        
-                        ui.monospace("DEL");
-                        ui.label("Delete the node");
-                        ui.end_row();
-                        
-                        ui.monospace("CTRL + C / CTRL + Insert");
-                        ui.label("Copy the node");
-                        ui.end_row();
-                        
-                        ui.monospace("CTRL + X");
-                        ui.label("Cut the node");
-                        ui.end_row();
-                        
-                        ui.monospace("SHIFT + Insert");
-                        ui.label("Paste the copied node into the node");
-                        ui.end_row();
-                        
-                        ui.monospace("CTRL + P");
-                        ui.label("Paste the copied node into the parent");
-                        ui.end_row();
-                        
-                        ui.monospace("CTRL + D");
-                        ui.label("Duplicate param on the same level");
-                        ui.end_row();
-                        
-                        ui.monospace("CTRL + S");
-                        ui.label("Save the file");
-                        ui.end_row();
-                        
-                        ui.monospace("CTRL + Z");
-                        ui.label("Undo last action");
-                        ui.end_row();
-                        
-                        ui.monospace("CTRL + Y");
-                        ui.label("Redo last undone action");
-                        ui.end_row();
-                        
-                        ui.monospace("F1");
-                        ui.label("Show this help");
-                        ui.end_row();
-                    });
-                
-                ui.separator();
-                
-                ui.horizontal(|ui| {
-                    if ui.button("Close").clicked() {
-                        self.show_shortcuts_help = false;
-                    }
-                });
-            });
-            
-        if !open {
-            self.show_shortcuts_help = false;
-        }
-    }
+
 }
 
 impl eframe::App for PrcEditorApp {
@@ -2475,17 +2622,7 @@ impl eframe::App for PrcEditorApp {
         // Handle keyboard shortcuts
         self.handle_keyboard_shortcuts(ctx);
         
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // Menu bar
-            self.show_menu_bar(ctx, ui);
-            
-            ui.separator();
-            
-            // Main content area
-            self.show_main_content(ctx, ui);
-        });
-        
-        // Status bar at bottom using bottom panel
+        // Status bar at bottom using bottom panel - create this FIRST so main content knows about it
         egui::TopBottomPanel::bottom("status_panel")
             .resizable(false)
             .min_height(25.0)
@@ -2494,11 +2631,8 @@ impl eframe::App for PrcEditorApp {
                     ui.label("Status:");
                     ui.label(&self.status_message);
                     
-                    // Show shortcuts button and paste buttons for testing
+                    // Show paste buttons for testing
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Shortcuts").clicked() {
-                            self.show_shortcuts_help = true;
-                        }
                         
                         // Add paste button for testing
                         if let Some(_) = &self.clipboard_data {
@@ -2554,10 +2688,18 @@ impl eframe::App for PrcEditorApp {
                 });
             });
         
+        // Main content area - now it knows about the status bar space
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // Menu bar
+            self.show_menu_bar(ctx, ui);
+            
+            ui.separator();
+            
+            // Main content area
+            self.show_main_content(ui);
+        });
+        
         // Show label editor window if open
         self.show_label_editor_window(ctx);
-        
-        // Show shortcuts help if open
-        self.show_shortcuts_help_window(ctx);
     }
 } 
